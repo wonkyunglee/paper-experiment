@@ -1,0 +1,15 @@
+
+# notebooks
+notebooks
+
+# configs
+configs
+
+# datasets
+datasets
+
+# model_dir
+model_dir
+
+# python
+*.pyc
