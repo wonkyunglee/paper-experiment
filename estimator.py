@@ -105,7 +105,11 @@ class Classifier(object):
             elif mode == tf.estimator.ModeKeys.TRAIN:
 
                 optimizer = tf.train.AdamOptimizer(learning_rate=params['learning_rate'])
-                train_op = optimizer.minimize(loss, global_step=tf.train.get_global_step())
+                gradients = optimizer.compute_gradients(loss)
+                clipped_gradients = [(tf.clip_by_value(grad, -1., 1.), var) for grad, var in gradients]
+                #train_op = optimizer.minimize(loss, global_step=tf.train.get_global_step())
+                train_op = optimizer.apply_gradients(clipped_gradients, global_step=tf.train.get_global_step())
+
                 logging_hook = tf.train.LoggingTensorHook({'loss':loss,
                                                            'false_negatives':false_negatives,
                                                            'auc':auc,
@@ -236,7 +240,7 @@ class CenterlossClassifier(Classifier):
             centers = tf.get_variable('centers',
                                       [self.params['n_classes'], params['hidden_units'][1]],
                                       dtype=tf.float32,
-                                      initializer=tf.constant_initializer(0), trainable=False)
+                                      initializer=tf.random_normal_initializer(), trainable=False)
 
             loss, c_update_op = loss_fn(logits, labels, centers, bottleneck)
             score = score_fn(logits)
@@ -297,15 +301,16 @@ class CenterlossClassifier(Classifier):
 
 
     def loss_fn(self, logits, labels, centers, bottleneck):
-        with tf.variable_scope('loss'):
+        with tf.variable_scope('loss_definition'):
             with tf.variable_scope('cross_entropy_loss'):
                 xentropy_loss = tf.losses.sigmoid_cross_entropy(multi_class_labels=labels, logits=logits)
             with tf.variable_scope('center_loss'):
                 center_loss, c_update_op = self.get_center_loss(labels, centers, bottleneck)
             with tf.variable_scope('regularizer'):
                 l2_loss = tf.losses.get_regularization_loss()
-
-            loss = xentropy_loss + center_loss + 0.001 * l2_loss
+            with tf.variable_scope('total_loss'):
+                loss = xentropy_loss + center_loss + 0.001 * l2_loss
+        #    loss = tf.Print(loss, [loss])
         return loss, c_update_op
 
 
@@ -326,7 +331,7 @@ class MultilabelCenterlossClassifier(CenterlossClassifier):
         return indices
 
 
-    def get_center_loss(self, labels, centers, bottleneck, alfa=0.99):
+    def get_center_loss(self, labels, centers, bottleneck, alpha=0.9):
         """Center loss based on the paper "A Discriminative Feature Learning Approach for Deep Face Recognition"
         (http://ydwen.github.io/papers/WenECCV16.pdf)
         """
@@ -334,17 +339,50 @@ class MultilabelCenterlossClassifier(CenterlossClassifier):
         one_num = tf.reduce_sum(labels_float, axis=1)
         batch_size = tf.shape(bottleneck)[0]
         one_num = tf.reshape(one_num, (batch_size, 1))
-        centers_batch = tf.divide(tf.matmul(labels_float, centers), one_num)   # centers : (num_labels, 2048) label : (batch, num_labels)
-        #centers_batch = tf.matmul(labels_float, centers)
-        diff = (1 - alfa) * (centers_batch - bottleneck) / one_num
-        #centers = tf.subtract(centers, tf.matmul(labels_float, diff, transpose_a=True))
-        diff_matrix = tf.matmul(labels_float, diff, transpose_a=True)
-        update_op = tf.assign_sub(centers, diff_matrix)
-        loss = tf.reduce_mean(tf.square(bottleneck - centers_batch))
-        #l2_loss = tf.reduce_mean(tf.norm(centers))
-        #loss = tf.Print(loss, [loss, l2_loss, centers_batch, diff, diff_matrix])
-
+        centers_batch = self.get_centers_batch(labels_float, centers, one_num)
+        diff = self.get_diff(alpha, centers_batch, bottleneck, one_num)
+        diff_matrix = tf.matmul(labels_float, diff, transpose_a=True) # shape : label_num * bottleneck_size
+        update_op = tf.assign(centers, (centers - diff_matrix) / tf.norm(centers - diff_matrix))
+        loss = tf.reduce_mean(tf.square(diff))
+        #l2_loss = tf.reduce_mean(tf.nn.l2_loss(centers))
+        #loss += l2_loss
+        loss = tf.Print(loss, [loss, centers_batch, diff, diff_matrix])
 
         return loss, update_op
+
+
+    def get_centers_batch(self, labels_float, centers, one_num):
+        raise NotImplementedError()
+
+
+    def get_diff(self, alpha, centers_batch, bottleneck, one_num):
+        raise NotImplementedError()
+
+
+
+class MultilabelMeanCenterlossClassifier(MultilabelCenterlossClassifier):
+
+
+    def get_centers_batch(self, labels_float, centers, one_num):
+        # centers : (num_labels, bottleneck_size) label : (batch, num_labels)
+        centers_batch = tf.divide(tf.matmul(labels_float, centers), one_num)
+        return centers_batch
+
+    def get_diff(self, alpha, centers_batch, bottleneck, one_num):
+        diff = (1 - alpha) * (centers_batch - bottleneck) / one_num # shape : batch_size * bottleneck_size
+        return diff
+
+
+
+class MultilabelAddCenterlossClassifier(MultilabelCenterlossClassifier):
+
+
+    def get_centers_batch(self, labels_float, centers, one_num):
+        centers_batch = tf.matmul(labels_float, centers)
+        return centers_batch
+
+    def get_diff(self, alpha, centers_batch, bottleneck, one_num):
+        diff = (1 - alpha) * (centers_batch - bottleneck)
+        return diff
 
 

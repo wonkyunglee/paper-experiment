@@ -3,7 +3,8 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.python import debug as tf_debug
 from loader import ThumbnailClassificationLoader, ThumbnailMultilabelLoader
-from estimator import Classifier, MultilabelClassifier, SinglelabelClassifier, MultilabelCenterlossClassifier
+from estimator import Classifier, MultilabelClassifier, SinglelabelClassifier
+from estimator import MultilabelAddCenterlossClassifier, MultilabelMeanCenterlossClassifier
 import os
 
 from config import TempConfig
@@ -21,7 +22,8 @@ def main():
     valid_input_fn = loader.valid_input_fn
     #estimator = SinglelabelClassifier(config).get_estimator()
     #estimator = MultilabelClassifier(config).get_estimator()
-    estimator = MultilabelCenterlossClassifier(config).get_estimator()
+    estimator = MultilabelAddCenterlossClassifier(config).get_estimator()
+    #estimator = MultilabelMeanCenterlossClassifier(config).get_estimator()
 
     estimator.train(input_fn=train_input_fn)
 
