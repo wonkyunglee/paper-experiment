@@ -105,10 +105,7 @@ class Classifier(object):
             elif mode == tf.estimator.ModeKeys.TRAIN:
 
                 optimizer = tf.train.AdamOptimizer(learning_rate=params['learning_rate'])
-                gradients = optimizer.compute_gradients(loss)
-                clipped_gradients = [(tf.clip_by_value(grad, -1., 1.), var) for grad, var in gradients]
-                #train_op = optimizer.minimize(loss, global_step=tf.train.get_global_step())
-                train_op = optimizer.apply_gradients(clipped_gradients, global_step=tf.train.get_global_step())
+                train_op = optimizer.minimize(loss, global_step=tf.train.get_global_step())
 
                 logging_hook = tf.train.LoggingTensorHook({'loss':loss,
                                                            'false_negatives':false_negatives,
@@ -278,7 +275,9 @@ class CenterlossClassifier(Classifier):
             elif mode == tf.estimator.ModeKeys.TRAIN:
 
                 optimizer = tf.train.AdamOptimizer(learning_rate=params['learning_rate'])
+                gradients = optimizer.compute_gradients(loss)
                 train_op = optimizer.minimize(loss, global_step=tf.train.get_global_step())
+
                 logging_hook = tf.train.LoggingTensorHook({'loss':loss,
                                                            'false_negatives':false_negatives,
                                                            'auc':auc,
@@ -316,6 +315,48 @@ class CenterlossClassifier(Classifier):
 
     def get_center_loss(self, labels, centers, bottleneck):
         raise NotImplementedError()
+
+
+class SinglelabelCenterlossClassifier(CenterlossClassifier):
+
+
+    def score_fn(self, logits):
+        score = tf.sigmoid(logits)
+        return score
+
+
+    def pred_fn(self, logits):
+        values, indices = tf.nn.top_k(logits, k=7, sorted=True)
+        return indices
+
+
+    def get_center_loss(self, labels, centers, bottleneck, alpha=0.9):
+        """Center loss based on the paper "A Discriminative Feature Learning Approach for Deep Face Recognition"
+        (http://ydwen.github.io/papers/WenECCV16.pdf)
+        """
+        labels_float = tf.cast(labels, tf.float32)
+        one_num = tf.reduce_sum(labels_float, axis=1)
+        batch_size = tf.shape(bottleneck)[0]
+        one_num = tf.reshape(one_num, (batch_size, 1))
+        centers_batch = self.get_centers_batch(labels_float, centers, one_num)
+        diff = self.get_diff(alpha, centers_batch, bottleneck, one_num)
+        diff_matrix = tf.matmul(labels_float, diff, transpose_a=True) # shape : label_num * bottleneck_size
+        update_op = tf.assign(centers, (centers - diff_matrix) / tf.norm(centers - diff_matrix))
+        loss = tf.reduce_mean(tf.square(diff))
+        #l2_loss = tf.reduce_mean(tf.nn.l2_loss(centers))
+        #loss += l2_loss
+        loss = tf.Print(loss, [loss, centers_batch, diff, diff_matrix])
+
+        return loss, update_op
+
+
+    def get_centers_batch(self, labels_float, centers, one_num):
+        raise NotImplementedError()
+
+
+    def get_diff(self, alpha, centers_batch, bottleneck, one_num):
+        raise NotImplementedError()
+
 
 
 class MultilabelCenterlossClassifier(CenterlossClassifier):
