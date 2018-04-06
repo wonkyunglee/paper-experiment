@@ -75,6 +75,7 @@ class Classifier(object):
             sparse_labels = pred_fn(labels)
             false_negatives, fn_update_op = false_negatives_fn(labels, score)
             auc, auc_update_op = auc_fn(labels, score)
+            tf.summary.scalar('auc', auc)
             embedding_train = tf.Variable(tf.zeros([params['train_data_num'], params['hidden_units'][1]]),
                                           name='embedding_train')
             embedding_train_update_op = tf.scatter_update(embedding_train,
@@ -114,12 +115,17 @@ class Classifier(object):
                                                            'labels':sparse_labels[0:5]
                                                             },
                                                           every_n_iter=100)
+                summary_hook = tf.train.SummarySaverHook(
+                    save_secs=60,
+                    output_dir=params['model_dir'],
+                    summary_op=tf.summary.merge_all()
+                )
 
                 train_ops = tf.group(train_op, fn_update_op, auc_update_op, embedding_train_update_op)
 
                 return tf.estimator.EstimatorSpec(mode, loss=loss, train_op=train_ops,
                                                   predictions=preds,
-                                                  training_hooks=[logging_hook])
+                                                  training_hooks=[logging_hook, summary_hook])
             elif mode == tf.estimator.ModeKeys.PREDICT:
                 raise NotImplementedError
 
@@ -162,7 +168,7 @@ class Classifier(object):
             model_fn=self.get_model_fn(),
             params=self.params,
             model_dir=self.model_dir,
-            config=tf.contrib.learn.RunConfig(session_config=sess_config))
+            config=tf.contrib.learn.RunConfig(session_config=sess_config, save_checkpoints_secs=60))
         return estimator
 
 
@@ -245,6 +251,7 @@ class CenterlossClassifier(Classifier):
             sparse_labels = pred_fn(labels)
             false_negatives, fn_update_op = false_negatives_fn(labels, score)
             auc, auc_update_op = auc_fn(labels, score)
+            tf.summary.scalar('auc', auc)
             embedding_train = tf.Variable(tf.zeros([params['train_data_num'], params['hidden_units'][1]]),
                                           name='embedding_train')
             embedding_train_update_op = tf.scatter_update(embedding_train,
@@ -285,13 +292,18 @@ class CenterlossClassifier(Classifier):
                                                            'labels':sparse_labels[0:5]
                                                             },
                                                           every_n_iter=100)
+                summary_hook = tf.train.SummarySaverHook(
+                    save_secs=60,
+                    output_dir=params['model_dir'],
+                    summary_op=tf.summary.merge_all()
+                )
 
                 train_ops = tf.group(train_op, fn_update_op, auc_update_op,
                                      embedding_train_update_op, c_update_op)
 
                 return tf.estimator.EstimatorSpec(mode, loss=loss, train_op=train_ops,
                                                   predictions=preds,
-                                                  training_hooks=[logging_hook])
+                                                  training_hooks=[logging_hook, summary_hook])
             elif mode == tf.estimator.ModeKeys.PREDICT:
                 raise NotImplementedError
 
@@ -310,6 +322,10 @@ class CenterlossClassifier(Classifier):
             with tf.variable_scope('total_loss'):
                 loss = xentropy_loss + center_loss + 0.001 * l2_loss
         #    loss = tf.Print(loss, [loss])
+        tf.summary.scalar("center_loss", center_loss)
+        tf.summary.scalar("cross_entropy_loss", xentropy_loss)
+        tf.summary.scalar("regularize_loss", l2_loss)
+
         return loss, c_update_op
 
 
@@ -372,10 +388,14 @@ class MultilabelCenterlossClassifier(CenterlossClassifier):
         return indices
 
 
-    def get_center_loss(self, labels, centers, bottleneck, alpha=0.9):
+    def get_center_loss(self, labels, centers, bottleneck, alpha=0.1):
         """Center loss based on the paper "A Discriminative Feature Learning Approach for Deep Face Recognition"
         (http://ydwen.github.io/papers/WenECCV16.pdf)
         """
+        #norm_tensor = tf.constant([1,1,1,1,1,1,1,1,1,1,3,3,3], dtype=tf.float32)
+        #norm_tensor = tf.constant([1,1,1,1,1,1,1,1,1,1,0.001,3,1], dtype=tf.float32)
+        norm_tensor = tf.constant([1,1,1,1,1,1,1,1,1,1,3,0.001,1], dtype=tf.float32)
+        norm_tensor = tf.reshape(norm_tensor, [13,1])
         labels_float = tf.cast(labels, tf.float32)
         one_num = tf.reduce_sum(labels_float, axis=1)
         batch_size = tf.shape(bottleneck)[0]
@@ -383,11 +403,13 @@ class MultilabelCenterlossClassifier(CenterlossClassifier):
         centers_batch = self.get_centers_batch(labels_float, centers, one_num)
         diff = self.get_diff(alpha, centers_batch, bottleneck, one_num)
         diff_matrix = tf.matmul(labels_float, diff, transpose_a=True) # shape : label_num * bottleneck_size
-        update_op = tf.assign(centers, (centers - diff_matrix) / tf.norm(centers - diff_matrix))
+        new_centers = centers - diff_matrix
+        norms = tf.reshape(tf.norm(new_centers, axis=1), [-1, 1])
+        update_op = tf.assign(centers, new_centers / norms * norm_tensor)
         loss = tf.reduce_mean(tf.square(diff))
         #l2_loss = tf.reduce_mean(tf.nn.l2_loss(centers))
         #loss += l2_loss
-        loss = tf.Print(loss, [loss, centers_batch, diff, diff_matrix])
+        loss = tf.Print(loss, [loss, tf.norm(centers[0]), tf.norm(centers[10]), diff, diff_matrix])
 
         return loss, update_op
 

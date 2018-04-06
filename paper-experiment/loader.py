@@ -1,9 +1,11 @@
 import os
+import gzip
+import urllib
+import shutil
 import numpy as np
 import tensorflow as tf
 from db_manager import DBManager
-
-
+from tensorflow.examples.tutorials.mnist import input_data
 
 
 def preprocess(filepath, length=224):
@@ -13,6 +15,11 @@ def preprocess(filepath, length=224):
     zero_padding = tf.zeros(zero_padding_size, dtype=tf.uint8)
     raw_padded = tf.concat(axis=0, values=[raw, zero_padding])
     image = tf.reshape(raw_padded, [-1, length, 1])
+    thumbnail = image_preprocess(image, length)
+    return thumbnail
+
+
+def image_preprocess(image, length=224):
     thumbnail = tf.image.resize_images(image, [length, length],
                                         method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
     subval = 127.5
@@ -122,11 +129,12 @@ class ThumbnailLoader(object):
         indices = tf.data.Dataset.from_tensor_slices(index_arr)
         rep_label = tf.data.Dataset.from_tensor_slices(rep_label_arr)
         labels = tf.data.Dataset.from_tensor_slices(labels_arr)
-        dataset = self.select_features(thumbnails, indices, rep_label, labels)
+        features, labels = self.select_features_and_labels(thumbnails, indices, rep_label, labels)
+        dataset = tf.data.Dataset.zip((features, labels))
         return dataset
 
 
-    def select_features(self):
+    def select_features_and_labels(self):
         raise NotImplementedError()
 
 
@@ -182,13 +190,14 @@ class ThumbnailMultilabelLoader(ThumbnailLoader):
         return labels_dense, rep_label
 
 
-    def select_features(self, thumbnails, indices, rep_label, labels):
-        dataset = tf.data.Dataset.zip(({'x':thumbnails, 'idx':indices, 'rep_label':rep_label}, labels))
-        return dataset
+    def select_features_and_labels(self, thumbnails, indices, rep_label, labels):
+        features = {'x':thumbnails, 'idx':indices, 'rep_label':rep_label}
+        labels = labels
+        return features, labels
 
 
 
-class ThumbnailClassificationLoader(ThumbnailLoader):
+class ThumbnailSinglelabelLoader(ThumbnailLoader):
 
     def get_dense_label(self, label):
         rep_label_sparse = [self.label_dict[label]]
@@ -201,65 +210,107 @@ class ThumbnailClassificationLoader(ThumbnailLoader):
         return labels, rep_label_dense
 
 
-    def select_features(self, thumbnails, indices, rep_label, labels):
-        dataset = tf.data.Dataset.zip(({'x':thumbnails, 'idx':indices, 'labels':labels}, rep_label))
-        return dataset
+    def select_features_and_labels(self, thumbnails, indices, rep_label, labels):
+        features = {'x':thumbnails, 'idx':indices, 'labels':labels}
+        labels = rep_label
+        return features, labels
 
 
 
 
-class MNISTLoader(object):
+class MnistLoader(object):
     """download, decode_image, decod_label methods are copied from
     https://github.com/tensorflow/models/blob/master/official/mnist/dataset.py
     """
     def __init__(self, config):
+        self.config = config
         self.batch_size = config.batch_size
         self.num_epochs = config.num_epochs
         self.shuffle_buffer = config.shuffle_buffer
         self.data_dir = config.data_dir
 
 
-    def get_dataset(self, images_filename, labels_filename):
-        images_filepath = self.download(self.data_dir, images_filename)
-        labels_filepath = self.download(self.data_dir, labels_filename)
+    def get_dataset(self, purpose):
+        data = input_data.read_data_sets(self.data_dir, one_hot=True)
+        if purpose == 'train':
+            data = data.train
+        elif purpose == 'valid':
+            data = data.test
 
-        def decode_image(image):
-            # Normalize from [0, 255] to [0.0, 1.0]
-            image = tf.decode_raw(image, tf.uint8)
-            image = tf.cast(image, tf.float32)
-            image = tf.reshape(image, [784])
-            return image / 255.0
+        np.random.seed(2018)
+        perm = np.arange(len(data.labels))
+        np.random.shuffle(perm)
 
-        def decode_label(label):
-            label = tf.decode_raw(label, tf.uint8)  # tf.string -> [tf.uint8]
-            label = tf.reshape(label, [])  # label is a scalar
-            return tf.to_int32(label)
+        images_np = data.images[perm].reshape(-1, 28, 28, 1)
+        rep_label_np = data.labels[perm]
+        indexes_np = np.arange(len(rep_label_np))
+        labels_np = self.get_labels_from_rep_label(rep_label_np)
+        self.save_tsv_file(indexes_np, rep_label_np, labels_np, purpose)
 
-        images = tf.data.FixedLengthRecordDataset(
-            images_filepath, 28 * 28, header_bytes=16).map(decode_image)
-        labels = tf.data.FixedLengthRecordDataset(
-            labels_filepath, 1, header_bytes=8).map(decode_label)
-        dataset = tf.data.Dataset.zip(({'x':images}, labels))
+        images = tf.data.Dataset.from_tensor_slices(images_np).map(
+            image_preprocess, num_parallel_calls=2)
+        rep_label = tf.data.Dataset.from_tensor_slices(rep_label_np)
+        indexes = tf.data.Dataset.from_tensor_slices(indexes_np)
+        labels = tf.data.Dataset.from_tensor_slices(labels_np)
+
+        features, labels = self.select_features_and_labels(images, labels, rep_label, indexes)
+        dataset = tf.data.Dataset.zip((features, labels))
         return dataset
 
 
-    def download(self, directory, filename):
-        """Download (and unzip) a file from the MNIST dataset if not already done."""
-        filepath = os.path.join(directory, filename)
-        if tf.gfile.Exists(filepath):
-            return filepath
-        if not tf.gfile.Exists(directory):
-            tf.gfile.MakeDirs(directory)
-        # CVDF mirror of http://yann.lecun.com/exdb/mnist/
-        url = 'https://storage.googleapis.com/cvdf-datasets/mnist/' + filename + '.gz'
-        zipped_filepath = filepath + '.gz'
-        print('Downloading %s to %s' % (url, zipped_filepath))
-        urllib.request.urlretrieve(url, zipped_filepath)
-        with gzip.open(zipped_filepath, 'rb') as f_in, open(filepath, 'wb') as f_out:
-            shutil.copyfileobj(f_in, f_out)
-        os.remove(zipped_filepath)
-        return filepath
+    def save_tsv_file(self, indexes_np, rep_label_np, labels_np, purpose):
+        metadata_path = os.path.join(self.config.model_dir, 'metadata_' + purpose + '.tsv')
 
+        with open(metadata_path, 'w') as f:
+            f.write('Index\tRepLabel\tLabels\n')
+            count = 0
+            for index, rep_label, labels in zip(indexes_np, rep_label_np, labels_np):
+                if count >= self.config.params[purpose + '_data_num']:
+                    break
+
+                rep_label = np.where(rep_label == 1)[0][0]
+                rep_label = self.index_dict[rep_label]
+                multilabels = ''
+                for i, label in enumerate(labels):
+                    if label == 1:
+                        multilabels += self.index_dict[i] + ','
+                multilabels = multilabels[:-1]
+                index = str(index)
+
+                f.write('%s\t%s\t%s\n'%(index, rep_label, multilabels))
+                count += 1
+
+
+    def get_labels_from_rep_label(self, rep_label):
+        multilabels = np.zeros([len(rep_label), 13])
+        # 10 : multiple of 2, 11: multiple of 3, 12: multiple of 5
+        for i, label in enumerate(rep_label):
+            label = np.where(label == 1)[0][0]
+            multilabels[i][label] = 1
+            if label % 2 == 0:
+                multilabels[i][10] = 1
+            if label % 3 == 0:
+                multilabels[i][11] = 1
+            if label % 5 == 0:
+                multilabels[i][12] = 1
+        return multilabels
+
+
+    def make_dicts_for_labels(self):
+        label_metadata_path = os.path.join(self.config.model_dir, 'metadata_label.tsv')
+        labels = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+                  'multiple_of_2', 'multiple_of_3', 'multiple_of_5']
+        indexes = range(len(labels))
+
+        with open(label_metadata_path, 'w') as f:
+            f.write('Index\tLabel\n')
+            for i, label in enumerate(labels):
+                f.write('%s\t%s\n'%(i, label))
+
+        self.label_dict = {label:index for label, index in zip(labels, indexes)}
+        self.index_dict = {index:label for label, index in zip(labels, indexes)}
+        self.label_num = len(self.label_dict)
+        print('label_num : %d'%self.label_num)
 
 
     def get_train_iterator(self, dataset):
@@ -272,26 +323,45 @@ class MNISTLoader(object):
 
 
     def get_test_iterator(self, dataset):
-        TEST_NUM = 10000  # the number of mnist-testset
         dataset = dataset.prefetch(buffer_size=self.batch_size)
         dataset = dataset.repeat(1)
-        dataset = dataset.batch(TEST_NUM)
+        dataset = dataset.batch(self.batch_size)
         iterator = dataset.make_one_shot_iterator()
         return iterator
 
 
     def train_input_fn(self):
-        dataset = self.get_dataset('train-images-idx3-ubyte', 'train-labels-idx1-ubyte')
+        dataset = self.get_dataset('train')
         iterator = self.get_train_iterator(dataset)
         images, labels = iterator.get_next()
         return images, labels
 
 
-    def test_input_fn(self):
-        dataset = self.get_dataset('t10k-images-idx3-ubyte', 't10k-labels-idx1-ubyte')
+    def valid_input_fn(self):
+        dataset = self.get_dataset('valid')
         iterator = self.get_test_iterator(dataset)
         images, labels = iterator.get_next()
         return images, labels
 
     def predict_input_fn(self):
         raise NotImplementedError
+
+
+class MnistSinglelabelLoader(MnistLoader):
+
+
+    def select_features_and_labels(self, images, labels, rep_label, indexes):
+        features = {'x':images, 'idx':indexes, 'labels':labels}
+        labels = rep_label
+        return features, labels
+
+
+
+class MnistMultilabelLoader(MnistLoader):
+
+
+    def select_features_and_labels(self, images, labels, rep_label, indexes):
+        features = {'x':images, 'idx':indexes, 'rep_label':rep_label}
+        return features, labels
+
+
