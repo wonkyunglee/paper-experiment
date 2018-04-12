@@ -37,6 +37,7 @@ class ThumbnailLoader(object):
         self.num_epochs = config.num_epochs
         self.shuffle_buffer = config.shuffle_buffer
         self.db_manager = DBManager(config)
+        self.make_dicts_for_labels()
 
 
     def make_dicts_for_labels(self):
@@ -228,6 +229,7 @@ class MnistLoader(object):
         self.num_epochs = config.num_epochs
         self.shuffle_buffer = config.shuffle_buffer
         self.data_dir = config.data_dir
+        self.make_dicts_for_labels()
 
 
     def get_dataset(self, purpose):
