@@ -20,7 +20,8 @@ def main():
     loader = config.get_loader()
     estimator = config.get_estimator()
 
-    estimator.train(input_fn=loader.train_input_fn)
+    eval_result = estimator.evaluate(input_fn=loader.valid_input_fn)
+    print(eval_result)
 
 
 if __name__ == '__main__':

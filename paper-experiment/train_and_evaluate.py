@@ -18,9 +18,10 @@ def main():
 
     tf.logging.set_verbosity(tf.logging.INFO)
     loader = config.get_loader()
-    estimator = config.get_estimator()
-
-    estimator.train(input_fn=loader.train_input_fn)
+    classifier = config.get_estimator()
+    train_spec = tf.estimator.TrainSpec(input_fn=loader.train_input_fn)
+    eval_spec = tf.estimator.EvalSpec(input_fn=loader.valid_input_fn)
+    tf.estimator.train_and_evaluate(classifier, train_spec, eval_spec)
 
 
 if __name__ == '__main__':
