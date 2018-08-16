@@ -251,6 +251,8 @@ class SinglelabelClassifier(Classifier):
 
     def loss_fn(self, logits, labels):
         loss = tf.losses.softmax_cross_entropy(onehot_labels=labels, logits=logits)
+        l2_loss = tf.losses.get_regularization_loss()
+        loss += 0.001 * l2_loss
         return loss
 
 
@@ -357,10 +359,10 @@ class CenterlossClassifier(Classifier):
                 bn_update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
                 optimizer = tf.train.AdamOptimizer(learning_rate=params['learning_rate'])
                 gradients = optimizer.compute_gradients(loss)
-                with tf.control_dependencies(bn_update_ops):
+                with tf.control_dependencies(bn_update_ops+[c_update_op]):
                     train_op = optimizer.minimize(loss, global_step=tf.train.get_global_step())
                 train_ops = tf.group(train_op, fn_update_op, auc_update_op, acc_update_op,
-                                     auc, accuracy, embedding_train_update_op, c_update_op,
+                                     auc, accuracy, embedding_train_update_op,
                                      sigmoid_train_update_op)
 
 
@@ -393,11 +395,11 @@ class CenterlossClassifier(Classifier):
             with tf.variable_scope('cross_entropy_loss'):
                 xentropy_loss = tf.losses.sigmoid_cross_entropy(multi_class_labels=labels, logits=logits)
             with tf.variable_scope('center_loss'):
-                center_loss, c_update_op = self.get_center_loss(labels, centers, bottleneck)
+                center_loss, c_update_op = self.get_center_loss(labels, centers, bottleneck, alpha=0.1)
             with tf.variable_scope('regularizer'):
                 l2_loss = tf.losses.get_regularization_loss()
             with tf.variable_scope('total_loss'):
-                loss = xentropy_loss + 10* center_loss + 0.001 * l2_loss
+                loss = xentropy_loss  + self.params['centerloss_coef'] * center_loss  + self.params['reg_coef'] * l2_loss
         #    loss = tf.Print(loss, [loss])
         tf.summary.scalar("center_loss", center_loss)
         tf.summary.scalar("cross_entropy_loss", xentropy_loss)
@@ -414,7 +416,7 @@ class SinglelabelCenterlossClassifier(CenterlossClassifier):
 
 
     def score_fn(self, logits):
-        score = tf.sigmoid(logits)
+        score = tf.nn.softmax(logits)
         return score
 
 
@@ -423,18 +425,16 @@ class SinglelabelCenterlossClassifier(CenterlossClassifier):
         return indices
 
 
-    def get_center_loss(self, labels, centers, bottleneck, alpha=0.9):
+    def get_center_loss2(self, labels, centers, bottleneck, alpha=0.9):
         """Center loss based on the paper "A Discriminative Feature Learning Approach for Deep Face Recognition"
         (http://ydwen.github.io/papers/WenECCV16.pdf)
         """
         labels_float = tf.cast(labels, tf.float32)
-        one_num = tf.reduce_sum(labels_float, axis=1)
         batch_size = tf.shape(bottleneck)[0]
-        one_num = tf.reshape(one_num, (batch_size, 1))
-        centers_batch = self.get_centers_batch(labels_float, centers, one_num)
-        diff = self.get_diff(alpha, centers_batch, bottleneck, one_num)
+        centers_batch = self.get_centers_batch(labels_float, centers)
+        diff = self.get_diff(alpha, centers_batch, bottleneck)
         diff_matrix = tf.matmul(labels_float, diff, transpose_a=True) # shape : label_num * bottleneck_size
-        update_op = tf.assign(centers, (centers - diff_matrix) / tf.norm(centers - diff_matrix))
+        update_op = tf.assign(centers, (centers - diff_matrix)) #/ tf.norm(centers - diff_matrix))
         loss = tf.reduce_mean(tf.square(diff))
         #l2_loss = tf.reduce_mean(tf.nn.l2_loss(centers))
         #loss += l2_loss
@@ -443,12 +443,71 @@ class SinglelabelCenterlossClassifier(CenterlossClassifier):
         return loss, update_op
 
 
-    def get_centers_batch(self, labels_float, centers, one_num):
-        raise NotImplementedError()
+    def get_centers_batch(self, labels_float, centers):
+        centers_batch = tf.matmul(labels_float, centers)
+        return centers_batch
+
+    def get_diff(self, alpha, centers_batch, bottleneck):
+        diff = (1 - alpha) * (centers_batch - bottleneck)
+        return diff
 
 
-    def get_diff(self, alpha, centers_batch, bottleneck, one_num):
-        raise NotImplementedError()
+    def get_center_loss3(self, labels, centers, bottleneck, alpha=0.5):
+        """Center loss based on the paper "A Discriminative Feature Learning Approach for Deep Face Recognition"
+        (http://ydwen.github.io/papers/WenECCV16.pdf)
+        """
+        labels = tf.where(tf.equal(labels, 1.0))[:,1] # onehot to dense
+        labels = tf.cast(labels, tf.int64)
+        labels = tf.reshape(labels, [-1])
+        centers_batch = tf.gather(centers, labels)
+        loss = tf.nn.l2_loss(bottleneck - centers_batch)
+        diff = centers_batch - bottleneck
+        unique_label, unique_idx, unique_count = tf.unique_with_counts(labels)
+        appear_times = tf.gather(unique_count, unique_idx)
+        appear_times = tf.reshape(appear_times, [-1, 1])
+        diff = diff / tf.cast((1 + appear_times), tf.float32)
+        diff = alpha * diff
+
+        update_op = tf.scatter_sub(centers, labels, diff)
+
+        return loss, update_op
+
+
+    def get_center_loss(self, labels, centers, bottleneck, alpha=0.5):
+        """Center loss based on the paper "A Discriminative Feature Learning Approach for Deep Face Recognition"
+        (http://ydwen.github.io/papers/WenECCV16.pdf)
+        """
+        labels = tf.cast(labels, tf.float32)
+        center_batch = tf.matmul(labels, centers)
+        unique_count = tf.reduce_sum(labels, axis=0)
+        unique_count = tf.reshape(unique_count, [-1, 1])
+
+        appear_times = tf.matmul(labels, unique_count)
+        diff = center_batch - bottleneck
+        loss = tf.nn.l2_loss(diff)
+        diff = alpha * diff / tf.cast((1 + appear_times), tf.float32)
+        diff_matrix = tf.matmul(labels, diff, transpose_a=True)
+        update_op = tf.assign_sub(centers, diff_matrix)
+
+        return loss, update_op
+
+
+    def loss_fn(self, logits, labels, centers, bottleneck):
+        with tf.variable_scope('loss_definition'):
+            with tf.variable_scope('cross_entropy_loss'):
+                xentropy_loss = tf.losses.softmax_cross_entropy(onehot_labels=labels, logits=logits)
+            with tf.variable_scope('center_loss'):
+                center_loss, c_update_op = self.get_center_loss(labels, centers, bottleneck)
+            with tf.variable_scope('regularizer'):
+                l2_loss = tf.losses.get_regularization_loss()
+            with tf.variable_scope('total_loss'):
+                loss = xentropy_loss  + 0.1* center_loss + 0.001 * l2_loss
+        #    loss = tf.Print(loss, [loss])
+        tf.summary.scalar("center_loss", center_loss)
+        tf.summary.scalar("cross_entropy_loss", xentropy_loss)
+        tf.summary.scalar("regularize_loss", l2_loss)
+
+        return loss, c_update_op
 
 
 
@@ -465,7 +524,7 @@ class MultilabelCenterlossClassifier(CenterlossClassifier):
         return indices
 
 
-    def get_center_loss(self, labels, centers, bottleneck, alpha=0.9):
+    def get_center_loss2(self, labels, centers, bottleneck, alpha=0.9):
         """Center loss based on the paper "A Discriminative Feature Learning Approach for Deep Face Recognition"
         (http://ydwen.github.io/papers/WenECCV16.pdf)
         """
@@ -482,9 +541,31 @@ class MultilabelCenterlossClassifier(CenterlossClassifier):
         norms = tf.reshape(tf.norm(new_centers, axis=1), [-1, 1])
         update_op = tf.assign(centers, new_centers / norms * norm_tensor)
         loss = tf.reduce_mean(tf.reduce_sum(tf.square(diff), axis=1))
-        #l2_loss = tf.reduce_mean(tf.nn.l2_loss(centers))
-        #loss += l2_loss
-        loss = tf.Print(loss, [loss, tf.norm(centers[0]), tf.norm(centers[10]), diff, diff_matrix])
+        # l2_loss = tf.reduce_mean(tf.nn.l2_loss(centers))
+        # loss += 0.01 * l2_loss
+        # loss += 0.01 * tf.reduce_mean(tf.square(tf.norm(centers, axis=1) - norm_tensor))
+        loss = tf.Print(loss, [loss, tf.norm(centers[0]), tf.norm(centers[1]), diff, diff_matrix])
+
+        return loss, update_op
+
+
+    def get_center_loss(self, labels, centers, bottleneck, alpha=0.5):
+        """Center loss based on the paper "A Discriminative Feature Learning Approach for Deep Face Recognition"
+        (http://ydwen.github.io/papers/WenECCV16.pdf)
+        """
+        labels = tf.cast(labels, tf.float32)
+        one_num = tf.reduce_sum(labels, axis=1)
+        one_num = tf.stop_gradient(tf.reshape(one_num, [-1,1]))
+        center_batch = self.get_centers_batch(labels, centers, one_num)
+        unique_count = tf.reduce_sum(labels, axis=0)
+        unique_count = tf.reshape(unique_count, [-1, 1])
+
+        appear_times = tf.matmul(labels, unique_count)
+        diff = center_batch - bottleneck
+        loss = tf.nn.l2_loss(diff)
+        diff = alpha * diff / tf.cast((1 + appear_times), tf.float32)
+        diff_matrix = tf.matmul(labels, diff, transpose_a=True)
+        update_op = tf.assign_sub(centers, diff_matrix)
 
         return loss, update_op
 
@@ -522,6 +603,75 @@ class MultilabelAddCenterlossClassifier(MultilabelCenterlossClassifier):
     def get_diff(self, alpha, centers_batch, bottleneck, one_num):
         diff = (1 - alpha) * (centers_batch - bottleneck) / one_num
         return diff
+
+
+class MultilabelMeanWeightedCenterlossClassifier(MultilabelMeanCenterlossClassifier):
+
+
+    def get_center_loss(self, labels, centers, bottleneck, alpha=0.5):
+        """Center loss based on the paper "A Discriminative Feature Learning Approach for Deep Face Recognition"
+        (http://ydwen.github.io/papers/WenECCV16.pdf)
+        """
+        norm_tensor = tf.constant(self.params['tag_weights'], dtype=tf.float32, name='tag_weights')
+        norm_tensor = tf.reshape(norm_tensor, [self.params['n_classes'],1])
+
+        labels = tf.cast(labels, tf.float32)
+        one_num = tf.reduce_sum(labels, axis=1)
+        one_num = tf.stop_gradient(tf.reshape(one_num, [-1,1]))
+        center_batch = self.get_centers_batch(labels, centers, one_num)
+        unique_count = tf.reduce_sum(labels, axis=0)
+        unique_count = tf.reshape(unique_count, [-1, 1])
+
+        appear_times = tf.matmul(labels, unique_count)
+        diff = center_batch - bottleneck
+        loss = tf.nn.l2_loss(diff)
+        #loss += tf.reduce_mean(tf.square(tf.norm(centers, axis=1) - norm_tensor))
+        diff = alpha * diff / tf.cast((1 + appear_times), tf.float32)
+        diff_matrix = tf.matmul(labels, diff, transpose_a=True)
+        #update_op = tf.assign_sub(centers, diff_matrix)
+
+        new_centers = centers - diff_matrix
+        norms = tf.reshape(tf.norm(new_centers, axis=1), [-1, 1])
+        norms = tf.stop_gradient(norms)
+        update_op = tf.assign(centers, new_centers / norms * norm_tensor)
+
+        return loss, update_op
+
+
+
+class MultilabelAddWeightedCenterlossClassifier(MultilabelAddCenterlossClassifier):
+
+
+    def get_center_loss(self, labels, centers, bottleneck, alpha=0.5):
+        """Center loss based on the paper "A Discriminative Feature Learning Approach for Deep Face Recognition"
+        (http://ydwen.github.io/papers/WenECCV16.pdf)
+        """
+        norm_tensor = tf.constant(self.params['tag_weights'], dtype=tf.float32, name='tag_weights')
+        norm_tensor = tf.reshape(norm_tensor, [self.params['n_classes'],1])
+
+        labels = tf.cast(labels, tf.float32)
+        one_num = tf.reduce_sum(labels, axis=1)
+        one_num = tf.stop_gradient(tf.reshape(one_num, [-1,1]))
+        center_batch = self.get_centers_batch(labels, centers, one_num)
+        unique_count = tf.reduce_sum(labels, axis=0)
+        unique_count = tf.reshape(unique_count, [-1, 1])
+
+        appear_times = tf.matmul(labels, unique_count)
+        diff = center_batch - bottleneck
+        loss = tf.nn.l2_loss(diff)
+        #loss += tf.reduce_mean(tf.square(tf.norm(centers, axis=1) - norm_tensor))
+        diff = alpha * diff / tf.cast((1 + appear_times) / one_num, tf.float32)
+        diff_matrix = tf.matmul(labels, diff, transpose_a=True)
+        #update_op = tf.assign_sub(centers, diff_matrix)
+
+        new_centers = centers - diff_matrix
+        norms = tf.reshape(tf.norm(new_centers, axis=1), [-1, 1])
+        norms = tf.stop_gradient(norms)
+        update_op = tf.assign(centers, new_centers / norms * norm_tensor)
+
+        return loss, update_op
+
+
 
 
 class VBCenterlossClassifier(MultilabelCenterlossClassifier):

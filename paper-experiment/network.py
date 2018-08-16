@@ -2,7 +2,8 @@ import tensorflow as tf
 
 
 def network_batchnorm(input_tensor, params, is_training=True):
-    initializer = tf.initializers.random_normal(0.0, 0.01)
+    #initializer = tf.initializers.random_normal(0.0, 0.01)
+    initializer = tf.contrib.layers.xavier_initializer()
     regularizer = tf.contrib.layers.l2_regularizer(scale=1.0)
     with tf.variable_scope('network'):
         with tf.variable_scope('cnn'):
@@ -65,7 +66,7 @@ def network_batchnorm(input_tensor, params, is_training=True):
                                   kernel_regularizer=regularizer,
                                   kernel_initializer=initializer, name='fc2')
             fc2 = tf.layers.batch_normalization(fc2, training=is_training, name='fc2_bn')
-            bottlenck = tf.nn.relu(fc2, name='bottleneck')
+            bottlenck = tf.nn.leaky_relu(fc2, name='bottleneck')
             logits = tf.layers.dense(inputs=bottlenck,
                                      units=params['n_classes'],
                                      kernel_regularizer=regularizer,
@@ -74,7 +75,8 @@ def network_batchnorm(input_tensor, params, is_training=True):
 
 
 def network_standard(input_tensor, params, is_training=True):
-    initializer = tf.initializers.random_normal(0.0, 0.01)
+    #initializer = tf.initializers.random_normal(0.0, 0.01)
+    initializer = tf.contrib.layers.xavier_initializer()
     regularizer = tf.contrib.layers.l2_regularizer(scale=1.0)
     with tf.variable_scope('network'):
         with tf.variable_scope('cnn'):
@@ -125,16 +127,17 @@ def network_standard(input_tensor, params, is_training=True):
                                   kernel_initializer=initializer, name='fc1',
                                   kernel_regularizer=regularizer,
                                   activation=tf.nn.relu)
-            bottlenck = tf.layers.dense(inputs=fc1,
+            bottleneck = tf.layers.dense(inputs=fc1,
                                   units=params['hidden_units'][1],
                                   kernel_initializer=initializer, name='bottleneck',
                                   kernel_regularizer=regularizer,
-                                  activation=tf.nn.relu)
-            logits = tf.layers.dense(inputs=bottlenck,
+                                  activation=None)
+            relu_bottleneck = tf.nn.relu(bottleneck)
+            logits = tf.layers.dense(inputs=relu_bottleneck,
                                   units=params['n_classes'],
                                   kernel_regularizer=regularizer,
                                   kernel_initializer=initializer, name='logit')
-    return logits, bottlenck
+    return logits, bottleneck
 
 
 def encoder_label_real(input_tensor, label_fake, params, is_training=True):
